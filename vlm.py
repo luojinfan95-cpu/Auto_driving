@@ -32,30 +32,11 @@ class ModelHandler:
         Imports are done dynamically to avoid package conflicts.
         """
 
-        if "gpt" in self.model_name or "claude" in self.model_name or "gemini" in self.model_name:
+        # 第一步：把 qwen 加入到 API 组里，这样它就不会去本地找模型了
+        if "gpt" in self.model_name or "claude" in self.model_name or "gemini" in self.model_name or "qwen" in self.model_name:
             print(f"Using {self.model_name} via API, no local model initialization required.")
+            return # 这一行很重要，执行完就直接结束，不再往下跑报错的代码了
 
-        elif "qwen" in self.model_name:
-            # Import Qwen modules only when needed
-            from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
-            
-            if self.model_name == "qwen2.5-7b":
-                print("Initializing Qwen2.5-VL-7B-Instruct model...")
-                model_path = "Qwen/Qwen2.5-VL-7B-Instruct"
-            elif self.model_name == "qwen2.5-72b":
-                print("Initializing Qwen2.5-VL-72B-Instruct model...")
-                model_path = "Qwen/Qwen2.5-VL-72B-Instruct"
-            else:
-                raise ValueError("Unsupported Qwen model, please try again.")
-                
-            self.model_instance = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-                model_path, 
-                torch_dtype=torch.bfloat16, 
-                device_map="auto",
-                token=self.hf_token
-            )
-            self.processor = AutoProcessor.from_pretrained(model_path, token=self.hf_token)
-            
         elif "llama" in self.model_name:
             # Import Llama modules only when needed
             from transformers import MllamaForConditionalGeneration, AutoProcessor
@@ -257,92 +238,55 @@ class ModelHandler:
 
     def _get_qwen_response(self, prompt, image_path):
         """
-        Generate a response using the Qwen model and count tokens.
+        使用阿里云 DashScope API 调用千问模型。
+        自动匹配命令行输入的模型名称，并修复 Windows 路径转义问题。
         """
+        import dashscope
+        from dashscope import MultiModalConversation
+        import os
+        from pathlib import Path
+        import urllib.parse
+
         token_counts = {"input": 0, "output": 0}
-        
-        try:
-            if self.model_instance is None or self.processor is None:
-                raise ValueError("Qwen model or processor not initialized.")
-                
-            # Import dependencies only when needed
-            from qwen_vl_utils import process_vision_info
+        dashscope.api_key = os.getenv("DASHSCOPE_API_KEY")
 
-            # Format messages according to Qwen's expected structure
-            messages = [
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image",
-                            "image": image_path
-                        },
-                        {"type": "text", "text": prompt}
-                    ]
-                }
-            ]
-            
-            # Apply chat template
-            text = self.processor.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True
-            )
-            
-            # Process images and videos
-            image_inputs, video_inputs = process_vision_info(messages)
+        # 路径处理：修复 Windows 路径中的 + 号和反斜杠
+        posix_path = Path(image_path).absolute().as_posix()
+        encoded_path = urllib.parse.quote(posix_path, safe=':/')
+        formatted_image_path = f"file://{encoded_path}"
 
-            # Find the model's primary device
-            model_device = next(self.model_instance.parameters()).device
-            
-            # Create model inputs
-            original_inputs = self.processor(
-                text=[text],
-                images=image_inputs,
-                videos=video_inputs,
-                padding=True,
-                return_tensors="pt"
-            )
-            
-            # Store the original input_ids for later reference
-            input_ids_length = original_inputs.input_ids.shape[1]
-            token_counts["input"] = input_ids_length
-            
-            # Move all tensors to the model's device
-            inputs = {k: v.to(model_device) if hasattr(v, 'to') else v for k, v in original_inputs.items()}
-            
-            # Generate output
-            with torch.no_grad():
-                generated_ids = self.model_instance.generate(
-                    **inputs, 
-                    max_new_tokens=512,
-                    do_sample=False
-                )
-                
-                # Process output according to Qwen's method
-                generated_ids_trimmed = [
-                    out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs["input_ids"], generated_ids)
+        # 映射模型名称：将 LightEMMA 的简写映射为 API 要求的全称
+        # 如果你开通的是 qwen-vl-max，请确保这里对应
+        target_model = 'qwen-vl-max' 
+        if "7b" in self.model_name:
+            target_model = 'qwen2.5-vl-7b-instruct' # 或者是你开通的具体 7B 版本名称
+
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"image": formatted_image_path},
+                    {"text": prompt}
                 ]
-                
-                output_text = self.processor.batch_decode(
-                    generated_ids_trimmed, 
-                    skip_special_tokens=True, 
-                    clean_up_tokenization_spaces=False
-                )
-                
-                # Count output tokens
-                token_counts["output"] = generated_ids_trimmed[0].shape[0] if generated_ids_trimmed else 0
-                
-                # Return only the first result as we're processing a single input
-                if output_text and len(output_text) > 0:
-                    return output_text[0], token_counts
-                else:
-                    return "Model generated an empty response", token_counts
-            
-        except Exception as e:
-            print(f"Error in Qwen inference: {str(e)}")
-            import traceback
-            traceback.print_exc()
-            return f"Error generating response: {str(e)}", token_counts
+            }
+        ]
 
+        try:
+            # 开始 API 调用
+            response = MultiModalConversation.call(model=target_model, messages=messages)
+            
+            if response.status_code == 200:
+                output_text = response.output.choices[0].message.content[0]['text']
+                if hasattr(response, 'usage'):
+                    token_counts["input"] = response.usage.get("input_tokens", 0)
+                    token_counts["output"] = response.usage.get("output_tokens", 0)
+                return output_text, token_counts
+            else:
+                # 提示：如果依然报 Unpurchased，说明 target_model 指定的模型你没在后台开通
+                return f"API Error: {response.code} - {response.message}", token_counts
+                
+        except Exception as e:
+            return f"Error during Qwen API call: {str(e)}", token_counts
     def _get_llama_response(self, prompt, image_path):
         """
         Generate a response using the Llama 3.2 Vision model and count tokens.
